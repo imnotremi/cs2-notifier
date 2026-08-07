@@ -35,6 +35,10 @@ RESULT_LOOKBACK_HOURS = 12       # notifie les scores des matchs finis dans les 
 LOCAL_TZ = "Europe/Paris"
 DEBUG = os.environ.get("DEBUG", "") in ("1", "true", "True")
 
+# Agenda : webhook Google Apps Script (ecrit dans l'agenda). Vide = desactive.
+GCAL_WEBHOOK_URL = os.environ.get("GCAL_WEBHOOK_URL", "")
+GCAL_WEBHOOK_TOKEN = os.environ.get("GCAL_WEBHOOK_TOKEN", "")
+
 # =====================================================================
 #  Moteur
 # =====================================================================
@@ -64,16 +68,17 @@ def log(m):
 
 
 def load_state():
+    empty = {"announced": [], "reminded": [], "scored": [], "calendared": []}
     if not os.path.exists(STATE_FILE):
-        return {"announced": [], "reminded": [], "scored": []}
+        return dict(empty)
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
-        for k in ("announced", "reminded", "scored"):
+        for k in empty:
             d.setdefault(k, [])
         return d
     except Exception:
-        return {"announced": [], "reminded": [], "scored": []}
+        return dict(empty)
 
 
 def save_state(s):
@@ -296,6 +301,39 @@ def notify_result(followed, m):
     })
 
 
+def _match_duration_minutes(m):
+    v = first_present(m, ["bo_type", "number_of_games", "best_of", "bo"])
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        n = 3
+    return {1: 75, 2: 120, 3: 180, 5: 300}.get(n, 150)
+
+
+def add_to_calendar(m, followed):
+    """Cree un evenement dans l'agenda via le webhook Google Apps Script."""
+    if not GCAL_WEBHOOK_URL:
+        return False
+    start = get_start_utc(m)
+    if not start:
+        return False
+    t1, t2 = get_team_names(m)
+    payload = {
+        "token": GCAL_WEBHOOK_TOKEN,
+        "title": f"CS2 — {t1} vs {t2}",
+        "start": start.isoformat(),
+        "durationMinutes": _match_duration_minutes(m),
+        "description": f"{get_tournament(m)} • {get_format(m)} • equipe suivie : {followed}",
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        GCAL_WEBHOOK_URL, data=data,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    urllib.request.urlopen(req, timeout=20)
+    return True
+
+
 def main():
     if not DISCORD_WEBHOOK_URL:
         log("Secret DISCORD_WEBHOOK_URL absent. Ajoute-le dans Settings > Secrets > Actions.")
@@ -335,6 +373,7 @@ def main():
     state = load_state()
     now = datetime.now(timezone.utc)
     announced, reminded, scored = set(state["announced"]), set(state["reminded"]), set(state["scored"])
+    calendared = set(state["calendared"])
     seen_up, seen_fin = set(), set()
 
     for m in upcoming:
@@ -344,6 +383,12 @@ def main():
             continue
         seen_up.add(mid)
         when = get_start_utc(m)
+        if when and mid not in calendared:
+            try:
+                if add_to_calendar(m, f):
+                    calendared.add(mid); log(f"Agenda + {mid} ({f})")
+            except Exception as e:
+                log(f"Echec agenda {mid}: {e}")
         if mid not in announced:
             try:
                 notify_match(f"📢 Nouveau match — {f}", f, m, COLOR_NEW)
@@ -377,6 +422,7 @@ def main():
     state["announced"] = [x for x in announced if x in seen_up]
     state["reminded"] = [x for x in reminded if x in seen_up]
     state["scored"] = [x for x in scored if x in seen_fin]
+    state["calendared"] = [x for x in calendared if x in seen_up]
     save_state(state)
     log("Termine.")
 
