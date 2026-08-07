@@ -29,7 +29,7 @@ except ImportError:
 # =====================================================================
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-TEAMS_TO_FOLLOW = ["Vitality", "Spirit", "MOUZ"]
+TEAMS_TO_FOLLOW = ["Vitality", "Spirit"]
 REMINDER_HOURS_BEFORE = 4        # rappel si match dans <= X h (mets 10 pour "le matin meme")
 RESULT_LOOKBACK_HOURS = 12       # notifie les scores des matchs finis dans les X dernieres h
 LOCAL_TZ = "Europe/Paris"
