@@ -81,15 +81,23 @@ def save_state(s):
         json.dump(s, f, ensure_ascii=False, indent=2)
 
 
+LAST_RAW = {"status": None, "len": 0, "body": "", "url": ""}
+
+
 def _fetch(status, sort):
+    from urllib.parse import urlencode
     p = dict(BASE_PARAMS)
     p["filter[matches.status][in]"] = status
     p["sort"] = sort
-    r = cr.get(BO3_URL, params=p, headers=BO3_HEADERS, impersonate="chrome", timeout=30)
+    # crochets/virgules litteraux : bo3 attend filter[...] non-encode
+    url = BO3_URL + "?" + urlencode(p, safe="[],.")
+    r = cr.get(url, headers=BO3_HEADERS, impersonate="chrome", timeout=30)
+    body = r.text
+    LAST_RAW.update({"status": r.status_code, "len": len(body), "body": body[:1200], "url": url})
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict):
-        return data.get("data") or data.get("matches") or []
+        return data.get("data") or data.get("matches") or data.get("items") or []
     return data if isinstance(data, list) else []
 
 
@@ -282,6 +290,9 @@ def main():
 
     if DEBUG:
         log("=== DEBUG : aucune notif envoyee ===")
+        log(f"[NET] derniere requete bo3 : status={LAST_RAW['status']} len={LAST_RAW['len']}")
+        log(f"[NET] url={LAST_RAW['url']}")
+        log(f"[NET] corps[:1200]={LAST_RAW['body']}")
         for label, lst in (("A VENIR", upcoming), ("TERMINES", finished)):
             log(f"-- {label} pour tes equipes --")
             for m in lst:
