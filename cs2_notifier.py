@@ -220,11 +220,25 @@ def get_winner_name(m):
     return None
 
 
+_STOP_WORDS = {"team", "esports", "gaming", "club", "the", "cs", "cs2"}
+
+
+def _sig_words(name):
+    # mots "significatifs" d'un nom d'equipe, hors mots generiques
+    return {w for w in str(name).lower().replace(".", " ").replace("-", " ").split()
+            if w and w not in _STOP_WORDS}
+
+
 def followed_in(m):
-    hay = (get_slug(m) + " " + " ".join(get_team_names(m))).lower()
-    for w in TEAMS_TO_FOLLOW:
-        if w.lower() in hay:
-            return w
+    # match sur le NOM EXACT de l'equipe (ensemble de mots), pas une sous-chaine :
+    # "Vitality" matche "Vitality"/"Team Vitality" mais PAS "Vitality Academy",
+    # "Spirit" ne matche ni "Spirit Academy" ni "Spirit HU", etc.
+    names = [n for n in get_team_names(m) if n and n != "?"]
+    for n in names:
+        sig = _sig_words(n)
+        for w in TEAMS_TO_FOLLOW:
+            if sig and sig == _sig_words(w):
+                return w
     return None
 
 
