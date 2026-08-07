@@ -31,6 +31,8 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DEBUG: ${{ vars.DEBUG_TEST }}   # cree une variable DEBUG_TEST=1 pour le mode test (absente = live)
+          GCAL_WEBHOOK_URL: ${{ secrets.GCAL_WEBHOOK_URL }}
+          GCAL_WEBHOOK_TOKEN: ${{ secrets.GCAL_WEBHOOK_TOKEN }}
         run: python cs2_notifier.py
 
       - name: Persist state
