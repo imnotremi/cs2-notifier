@@ -30,7 +30,7 @@ jobs:
       - name: Run notifier
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          DEBUG: ${{ vars.DEBUG }}     # mets une variable DEBUG=1 pour le mode test
+          DEBUG: ${{ vars.DEBUG_TEST }}   # cree une variable DEBUG_TEST=1 pour le mode test (absente = live)
         run: python cs2_notifier.py
 
       - name: Persist state
