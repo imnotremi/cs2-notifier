@@ -135,11 +135,25 @@ def bo3_url(m):
     return f"https://bo3.gg/matches/{slug}" if slug else None
 
 
-def get_stream_url(m):
-    """Lien du stream le plus pertinent (Twitch OFFICIEL en ANGLAIS en priorite),
-    recupere en direct depuis le detail bo3 du match. None si aucun stream (match
-    pas encore live). Ordre de preference : officiel+anglais > anglais > officiel >
-    le plus regarde."""
+def _pick_stream(streams, official_only):
+    """Choisit le meilleur stream. official_only=True -> uniquement les officiels.
+    Ordre : officiel+anglais > (officiel|anglais) > le plus regarde."""
+    cand = [s for s in streams if s.get("official")] if official_only else list(streams)
+    if not cand:
+        return None
+
+    def score(s):
+        off = 2 if s.get("official") else 0
+        en = 1 if (s.get("language") or "").lower() == "en" else 0
+        return (off + en, s.get("viewers_number") or 0)
+
+    return max(cand, key=score)
+
+
+def get_stream_url(m, official_only=False):
+    """Lien du stream, recupere en direct depuis le detail bo3. official_only=True
+    ne renvoie QUE le stream officiel (sinon None). Ordre : officiel+anglais > ...
+    None si aucun stream correspondant (match pas encore live / pas d'officiel)."""
     slug = get_slug(m)
     if not slug:
         return None
@@ -148,16 +162,8 @@ def get_stream_url(m):
         streams = (r.json() or {}).get("streams") or []
     except Exception:
         return None
-    if not streams:
-        return None
-
-    def score(s):
-        off = 2 if s.get("official") else 0
-        en = 1 if (s.get("language") or "").lower() == "en" else 0
-        return (off + en, s.get("viewers_number") or 0)
-
-    best = max(streams, key=score)
-    return best.get("raw_url") or best.get("embed_url")
+    best = _pick_stream(streams, official_only)
+    return (best.get("raw_url") or best.get("embed_url")) if best else None
 
 
 def get_team_names(m):
@@ -299,7 +305,7 @@ def send_embed(embed):
     urllib.request.urlopen(req, timeout=20)
 
 
-def notify_match(title, followed, m, color, footer_extra=""):
+def notify_match(title, followed, m, color, footer_extra="", stream_url=None):
     t1, t2 = get_team_names(m)
     when = get_start_utc(m)
     fields = [
@@ -307,11 +313,11 @@ def notify_match(title, followed, m, color, footer_extra=""):
         {"name": "🏆 Tournoi", "value": get_tournament(m), "inline": True},
         {"name": "🎮 Format", "value": get_format(m), "inline": True},
     ]
-    stream = get_stream_url(m)
+    stream = stream_url or get_stream_url(m, official_only=True)
     url = stream or bo3_url(m)
     if url:
-        name = "🔴 Stream" if stream else "📺 Où regarder"
-        label = "Regarder sur Twitch" if stream else "Voir les streams (page bo3)"
+        name = "🔴 Stream officiel" if stream else "📺 Où regarder"
+        label = "Regarder le stream officiel" if stream else "Voir les streams (page bo3)"
         fields.append({"name": name, "value": f"[{label}]({url})", "inline": False})
     send_embed({
         "title": title,
@@ -453,13 +459,16 @@ def main():
                     reminded.add(mid); log(f"Rappel {mid} ({f})")
                 except Exception as e:
                     log(f"Echec rappel {mid}: {e}")
-        # match EN DIRECT -> notif avec le lien du stream direct (une seule fois)
-        if m.get("status") == "current" and mid not in streamed and get_stream_url(m):
-            try:
-                notify_match(f"🔴 En direct — {f}", f, m, COLOR_REMINDER)
-                streamed.add(mid); log(f"Live {mid} ({f})")
-            except Exception as e:
-                log(f"Echec live {mid}: {e}")
+        # match EN DIRECT -> notif avec le stream OFFICIEL (envoyee une seule fois,
+        # et SEULEMENT quand l'officiel est dispo -> jamais un streamer random)
+        if m.get("status") == "current" and mid not in streamed:
+            su = get_stream_url(m, official_only=True)
+            if su:
+                try:
+                    notify_match(f"🔴 En direct — {f}", f, m, COLOR_REMINDER, stream_url=su)
+                    streamed.add(mid); log(f"Live {mid} ({f})")
+                except Exception as e:
+                    log(f"Echec live {mid}: {e}")
 
     for m in finished:
         mid = get_match_id(m)
