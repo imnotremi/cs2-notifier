@@ -135,25 +135,41 @@ def bo3_url(m):
     return f"https://bo3.gg/matches/{slug}" if slug else None
 
 
-def _pick_stream(streams, official_only):
-    """Choisit le meilleur stream. official_only=True -> uniquement les officiels.
-    Ordre : officiel+anglais > (officiel|anglais) > le plus regarde."""
-    cand = [s for s in streams if s.get("official")] if official_only else list(streams)
+# Chaines officielles ANGLAISES connues (le flag "official" de bo3 n'est pas fiable :
+# EWC_Plus_EN y est marque official:false, alors que des casters regionaux sont official:true).
+_OFFICIAL_HINTS = ("ewc_plus_en", "blastpremier", "esl_csgo", "eslcs", "pgl",
+                   "dreamhack", "thescore", "gamersclub", "faceit", "iem", "blasttv")
+
+
+def _pick_official_twitch_en(streams):
+    """Meilleur stream TWITCH en ANGLAIS et officiel. None si aucun ne convient.
+    On combine : chaine connue (+10) > suffixe _en (+5) > flag officiel bo3 (+2) > audience."""
+    cand = [s for s in streams
+            if "twitch.tv" in (s.get("raw_url") or "").lower()
+            and (s.get("language") or "").lower() == "en"]
     if not cand:
         return None
 
     def score(s):
-        off = 2 if s.get("official") else 0
-        en = 1 if (s.get("language") or "").lower() == "en" else 0
-        return (off + en, s.get("viewers_number") or 0)
+        name = (s.get("name") or "").lower()
+        raw = (s.get("raw_url") or "").lower()
+        sc = 0
+        if any(h in name or h in raw for h in _OFFICIAL_HINTS):
+            sc += 10
+        if name.endswith("_en"):
+            sc += 5
+        if s.get("official"):
+            sc += 2
+        return (sc, s.get("viewers_number") or 0)
 
-    return max(cand, key=score)
+    best = max(cand, key=score)
+    # si le meilleur n'a AUCUN signal officiel (que du community anglais) -> on n'envoie pas
+    return best if score(best)[0] > 0 else None
 
 
-def get_stream_url(m, official_only=False):
-    """Lien du stream, recupere en direct depuis le detail bo3. official_only=True
-    ne renvoie QUE le stream officiel (sinon None). Ordre : officiel+anglais > ...
-    None si aucun stream correspondant (match pas encore live / pas d'officiel)."""
+def get_stream_url(m):
+    """Lien du stream officiel ANGLAIS sur TWITCH (jamais Kick/YouTube), recupere en
+    direct depuis bo3. None si pas dispo (match pas live / pas d'officiel anglais twitch)."""
     slug = get_slug(m)
     if not slug:
         return None
@@ -162,8 +178,8 @@ def get_stream_url(m, official_only=False):
         streams = (r.json() or {}).get("streams") or []
     except Exception:
         return None
-    best = _pick_stream(streams, official_only)
-    return (best.get("raw_url") or best.get("embed_url")) if best else None
+    best = _pick_official_twitch_en(streams)
+    return best.get("raw_url") if best else None
 
 
 def get_team_names(m):
@@ -313,11 +329,11 @@ def notify_match(title, followed, m, color, footer_extra="", stream_url=None):
         {"name": "🏆 Tournoi", "value": get_tournament(m), "inline": True},
         {"name": "🎮 Format", "value": get_format(m), "inline": True},
     ]
-    stream = stream_url or get_stream_url(m, official_only=True)
+    stream = stream_url or get_stream_url(m)
     url = stream or bo3_url(m)
     if url:
         name = "🔴 Stream officiel" if stream else "📺 Où regarder"
-        label = "Regarder le stream officiel" if stream else "Voir les streams (page bo3)"
+        label = "Regarder sur Twitch (officiel)" if stream else "Voir les streams (page bo3)"
         fields.append({"name": name, "value": f"[{label}]({url})", "inline": False})
     send_embed({
         "title": title,
@@ -462,7 +478,7 @@ def main():
         # match EN DIRECT -> notif avec le stream OFFICIEL (envoyee une seule fois,
         # et SEULEMENT quand l'officiel est dispo -> jamais un streamer random)
         if m.get("status") == "current" and mid not in streamed:
-            su = get_stream_url(m, official_only=True)
+            su = get_stream_url(m)
             if su:
                 try:
                     notify_match(f"🔴 En direct — {f}", f, m, COLOR_REMINDER, stream_url=su)
