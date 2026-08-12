@@ -68,7 +68,7 @@ def log(m):
 
 
 def load_state():
-    empty = {"announced": [], "reminded": [], "scored": [], "calendared": []}
+    empty = {"announced": [], "reminded": [], "scored": [], "calendared": [], "streamed": []}
     if not os.path.exists(STATE_FILE):
         return dict(empty)
     try:
@@ -133,6 +133,31 @@ def bo3_url(m):
     """Page bo3.gg du match (elle affiche les streams officiels, Twitch inclus)."""
     slug = get_slug(m)
     return f"https://bo3.gg/matches/{slug}" if slug else None
+
+
+def get_stream_url(m):
+    """Lien du stream le plus pertinent (Twitch OFFICIEL en ANGLAIS en priorite),
+    recupere en direct depuis le detail bo3 du match. None si aucun stream (match
+    pas encore live). Ordre de preference : officiel+anglais > anglais > officiel >
+    le plus regarde."""
+    slug = get_slug(m)
+    if not slug:
+        return None
+    try:
+        r = cr.get(f"{BO3_URL}/{slug}", headers=BO3_HEADERS, impersonate="chrome", timeout=20)
+        streams = (r.json() or {}).get("streams") or []
+    except Exception:
+        return None
+    if not streams:
+        return None
+
+    def score(s):
+        off = 2 if s.get("official") else 0
+        en = 1 if (s.get("language") or "").lower() == "en" else 0
+        return (off + en, s.get("viewers_number") or 0)
+
+    best = max(streams, key=score)
+    return best.get("raw_url") or best.get("embed_url")
 
 
 def get_team_names(m):
@@ -282,9 +307,12 @@ def notify_match(title, followed, m, color, footer_extra=""):
         {"name": "🏆 Tournoi", "value": get_tournament(m), "inline": True},
         {"name": "🎮 Format", "value": get_format(m), "inline": True},
     ]
-    url = bo3_url(m)
+    stream = get_stream_url(m)
+    url = stream or bo3_url(m)
     if url:
-        fields.append({"name": "📺 Streams", "value": f"[Regarder le match]({url})", "inline": False})
+        name = "🔴 Stream" if stream else "📺 Où regarder"
+        label = "Regarder sur Twitch" if stream else "Voir les streams (page bo3)"
+        fields.append({"name": name, "value": f"[{label}]({url})", "inline": False})
     send_embed({
         "title": title,
         "description": f"**{t1}**  vs  **{t2}**",
@@ -389,6 +417,7 @@ def main():
     _raw_cal = state.get("calendared") or []
     # nouveau format = dict {matchId: heure_iso} ; ancien format = liste -> on convertit
     calendared = dict(_raw_cal) if isinstance(_raw_cal, dict) else {str(x): None for x in _raw_cal}
+    streamed = set(state.get("streamed") or [])
     seen_up, seen_fin = set(), set()
 
     for m in upcoming:
@@ -424,6 +453,13 @@ def main():
                     reminded.add(mid); log(f"Rappel {mid} ({f})")
                 except Exception as e:
                     log(f"Echec rappel {mid}: {e}")
+        # match EN DIRECT -> notif avec le lien du stream direct (une seule fois)
+        if m.get("status") == "current" and mid not in streamed and get_stream_url(m):
+            try:
+                notify_match(f"🔴 En direct — {f}", f, m, COLOR_REMINDER)
+                streamed.add(mid); log(f"Live {mid} ({f})")
+            except Exception as e:
+                log(f"Echec live {mid}: {e}")
 
     for m in finished:
         mid = get_match_id(m)
@@ -443,6 +479,7 @@ def main():
     state["scored"] = [x for x in scored if x in seen_fin]
     _seen_str = {str(x) for x in seen_up}
     state["calendared"] = {k: v for k, v in calendared.items() if k in _seen_str}
+    state["streamed"] = [x for x in streamed if x in seen_up]
     save_state(state)
     log("Termine.")
 
