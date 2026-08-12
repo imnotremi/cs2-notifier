@@ -129,6 +129,12 @@ def get_slug(m):
     return first_present(m, ["slug", "url", "name"]) or ""
 
 
+def bo3_url(m):
+    """Page bo3.gg du match (elle affiche les streams officiels, Twitch inclus)."""
+    slug = get_slug(m)
+    return f"https://bo3.gg/matches/{slug}" if slug else None
+
+
 def get_team_names(m):
     names = []
     teams = m.get("teams")
@@ -271,15 +277,19 @@ def send_embed(embed):
 def notify_match(title, followed, m, color, footer_extra=""):
     t1, t2 = get_team_names(m)
     when = get_start_utc(m)
+    fields = [
+        {"name": "🗓️ Quand", "value": to_local(when) if when else "date a confirmer", "inline": False},
+        {"name": "🏆 Tournoi", "value": get_tournament(m), "inline": True},
+        {"name": "🎮 Format", "value": get_format(m), "inline": True},
+    ]
+    url = bo3_url(m)
+    if url:
+        fields.append({"name": "📺 Streams", "value": f"[Regarder le match]({url})", "inline": False})
     send_embed({
         "title": title,
         "description": f"**{t1}**  vs  **{t2}**",
         "color": color,
-        "fields": [
-            {"name": "🗓️ Quand", "value": to_local(when) if when else "date a confirmer", "inline": False},
-            {"name": "🏆 Tournoi", "value": get_tournament(m), "inline": True},
-            {"name": "🎮 Format", "value": get_format(m), "inline": True},
-        ],
+        "fields": fields,
         "footer": {"text": f"Equipe suivie : {followed}{footer_extra}"},
     })
 
@@ -310,8 +320,10 @@ def _match_duration_minutes(m):
     return {1: 75, 2: 120, 3: 180, 5: 300}.get(n, 150)
 
 
-def add_to_calendar(m, followed):
-    """Cree un evenement dans l'agenda via le webhook Google Apps Script."""
+def add_to_calendar(m, followed, mid):
+    """Cree OU met a jour l'evenement dans l'agenda via le webhook Google Apps
+    Script. Le matchId permet a l'Apps Script de retrouver le bon event et de
+    le mettre a jour (au lieu de creer un doublon) quand l'heure change."""
     if not GCAL_WEBHOOK_URL:
         return False
     start = get_start_utc(m)
@@ -320,6 +332,7 @@ def add_to_calendar(m, followed):
     t1, t2 = get_team_names(m)
     payload = {
         "token": GCAL_WEBHOOK_TOKEN,
+        "matchId": str(mid),
         "title": f"CS2 — {t1} vs {t2}",
         "start": start.isoformat(),
         "durationMinutes": _match_duration_minutes(m),
@@ -373,7 +386,9 @@ def main():
     state = load_state()
     now = datetime.now(timezone.utc)
     announced, reminded, scored = set(state["announced"]), set(state["reminded"]), set(state["scored"])
-    calendared = set(state["calendared"])
+    _raw_cal = state.get("calendared") or []
+    # nouveau format = dict {matchId: heure_iso} ; ancien format = liste -> on convertit
+    calendared = dict(_raw_cal) if isinstance(_raw_cal, dict) else {str(x): None for x in _raw_cal}
     seen_up, seen_fin = set(), set()
 
     for m in upcoming:
@@ -383,10 +398,14 @@ def main():
             continue
         seen_up.add(mid)
         when = get_start_utc(m)
-        if when and mid not in calendared:
+        smid = str(mid)
+        cur_start = when.isoformat() if when else None
+        # nouveau match OU heure changee (bo3 a corrige) -> on (re)pousse dans l'agenda
+        if when and calendared.get(smid) != cur_start:
             try:
-                if add_to_calendar(m, f):
-                    calendared.add(mid); log(f"Agenda + {mid} ({f})")
+                if add_to_calendar(m, f, mid):
+                    calendared[smid] = cur_start
+                    log(f"Agenda maj {mid} ({f}) -> {to_local(when)}")
             except Exception as e:
                 log(f"Echec agenda {mid}: {e}")
         if mid not in announced:
@@ -422,7 +441,8 @@ def main():
     state["announced"] = [x for x in announced if x in seen_up]
     state["reminded"] = [x for x in reminded if x in seen_up]
     state["scored"] = [x for x in scored if x in seen_fin]
-    state["calendared"] = [x for x in calendared if x in seen_up]
+    _seen_str = {str(x) for x in seen_up}
+    state["calendared"] = {k: v for k, v in calendared.items() if k in _seen_str}
     save_state(state)
     log("Termine.")
 
