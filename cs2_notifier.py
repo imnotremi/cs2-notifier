@@ -29,7 +29,9 @@ except ImportError:
 # =====================================================================
 
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-TEAMS_TO_FOLLOW = ["Vitality", "Spirit"]
+# Ordre de PREFERENCE : Vitality d'abord, puis Spirit, puis 3DMAX.
+# Quand deux equipes suivies se rencontrent, on parle toujours de la mieux classee ici.
+TEAMS_TO_FOLLOW = ["Vitality", "Spirit", "3DMAX"]
 REMINDER_HOURS_BEFORE = 4        # rappel si match dans <= X h (mets 10 pour "le matin meme")
 RESULT_LOOKBACK_HOURS = 12       # notifie les scores des matchs finis dans les X dernieres h
 LOCAL_TZ = "Europe/Paris"
@@ -61,6 +63,9 @@ BASE_PARAMS = {
 COLOR_NEW = 0x89BFF4
 COLOR_REMINDER = 0xFFB100
 COLOR_RESULT = 0x3BA55D
+COLOR_WIN = 0x3BA55D          # victoire de l'equipe suivie (vert)
+COLOR_LOSS = 0xED4245         # defaite de l'equipe suivie (rouge)
+COLOR_MOVED = 0xFF6B00        # match deplace / horaire change (orange vif)
 
 
 def log(m):
@@ -291,13 +296,67 @@ def followed_in(m):
     # match sur le NOM EXACT de l'equipe (ensemble de mots), pas une sous-chaine :
     # "Vitality" matche "Vitality"/"Team Vitality" mais PAS "Vitality Academy",
     # "Spirit" ne matche ni "Spirit Academy" ni "Spirit HU", etc.
+    # On renvoie l'equipe la MIEUX classee dans TEAMS_TO_FOLLOW (ordre de preference),
+    # donc un Vitality vs Spirit parle toujours de Vitality.
     names = [n for n in get_team_names(m) if n and n != "?"]
-    for n in names:
-        sig = _sig_words(n)
-        for w in TEAMS_TO_FOLLOW:
-            if sig and sig == _sig_words(w):
-                return w
+    name_sigs = [_sig_words(n) for n in names]
+    for w in TEAMS_TO_FOLLOW:                 # parcours dans l'ordre de preference
+        wsig = _sig_words(w)
+        if wsig and any(wsig == s for s in name_sigs):
+            return w
     return None
+
+
+def _bo_number(m):
+    v = first_present(m, ["bo_type", "number_of_games", "best_of", "bo"])
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _map_scores(m):
+    """Score en MAPS gagnees (s1, s2) aligne sur team1/team2. (None, None) si illisible.
+    bo3 fournit soit une liste `teams`, soit les champs `team1_score`/`team2_score`."""
+    teams = m.get("teams")
+    if isinstance(teams, list) and len(teams) >= 2:
+        vals = [first_present(t, ["score", "wins", "won_maps", "result"]) for t in teams[:2]]
+        try:
+            return int(vals[0]), int(vals[1])
+        except (TypeError, ValueError):
+            pass
+    for a, b in (("team1_score", "team2_score"), ("score_1", "score_2"),
+                 ("home_score", "away_score"), ("results1", "results2")):
+        s1, s2 = m.get(a), m.get(b)
+        if s1 is not None and s2 is not None:
+            try:
+                return int(s1), int(s2)
+            except (TypeError, ValueError):
+                pass
+    return None, None
+
+
+def _match_complete(m):
+    """True seulement si le match est VRAIMENT termine (le vainqueur a atteint le nombre
+    de maps requis). Empeche d'annoncer un 'resultat' des la 1re map d'un Bo3."""
+    bo = _bo_number(m)
+    if not bo or bo < 2:
+        return True                          # Bo1 (ou format inconnu) : 1 map suffit
+    need = bo // 2 + 1                        # Bo3 -> 2 maps, Bo5 -> 3 maps
+    s1, s2 = _map_scores(m)
+    if s1 is None:
+        return True                          # score illisible -> on ne bloque pas
+    return max(s1, s2) >= need
+
+
+def _ordered(m, followed):
+    """(nom1, nom2, score1, score2) avec l'EQUIPE SUIVIE toujours en premier."""
+    t1, t2 = get_team_names(m)
+    s1, s2 = _map_scores(m)
+    fsig = _sig_words(followed)
+    if _sig_words(t2) == fsig and _sig_words(t1) != fsig:
+        return t2, t1, s2, s1
+    return t1, t2, s1, s2
 
 
 def to_local(dt_utc):
@@ -322,7 +381,7 @@ def send_embed(embed):
 
 
 def notify_match(title, followed, m, color, footer_extra="", stream_url=None):
-    t1, t2 = get_team_names(m)
+    n1, n2 = _ordered(m, followed)[:2]       # equipe suivie en premier
     when = get_start_utc(m)
     fields = [
         {"name": "🗓️ Quand", "value": to_local(when) if when else "date a confirmer", "inline": False},
@@ -337,7 +396,7 @@ def notify_match(title, followed, m, color, footer_extra="", stream_url=None):
         fields.append({"name": name, "value": f"[{label}]({url})", "inline": False})
     send_embed({
         "title": title,
-        "description": f"**{t1}**  vs  **{t2}**",
+        "description": f"**{n1}**  vs  **{n2}**",
         "color": color,
         "fields": fields,
         "footer": {"text": f"Equipe suivie : {followed}{footer_extra}"},
@@ -345,19 +404,45 @@ def notify_match(title, followed, m, color, footer_extra="", stream_url=None):
 
 
 def notify_result(followed, m):
-    t1, t2 = get_team_names(m)
-    score = get_score(m)
+    # tout est raconte du point de vue de l'equipe suivie (elle est en premier)
+    n1, n2, s1, s2 = _ordered(m, followed)
     winner = get_winner_name(m)
-    desc = f"**{t1}**  {score}  **{t2}**" if score else f"**{t1}**  vs  **{t2}**  (termine)"
+    won = bool(winner) and _sig_words(winner) == _sig_words(followed)
+    if s1 is not None and s2 is not None:
+        desc = f"**{n1}**  {s1} - {s2}  **{n2}**"
+    else:
+        desc = f"**{n1}**  vs  **{n2}**  (termine)"
     fields = [{"name": "🏆 Tournoi", "value": get_tournament(m), "inline": True}]
     if winner:
-        fields.append({"name": "🥇 Vainqueur", "value": winner, "inline": True})
+        verdict = f"✅ Victoire de {followed} !" if won else f"❌ Defaite de {followed}"
+        fields.append({"name": "Resultat", "value": verdict, "inline": True})
+        color = COLOR_WIN if won else COLOR_LOSS
+    else:
+        color = COLOR_RESULT
     send_embed({
         "title": f"🏁 Resultat — {followed}",
         "description": desc,
-        "color": COLOR_RESULT,
+        "color": color,
         "fields": fields,
         "footer": {"text": f"Equipe suivie : {followed}"},
+    })
+
+
+def notify_moved(followed, m, old_iso, new_dt):
+    """Notif SPECIALE quand l'horaire d'un match a change (ex : 18h -> 13h)."""
+    n1, n2 = _ordered(m, followed)[:2]
+    old_dt = _dt(old_iso)
+    fields = [
+        {"name": "🕐 Ancien horaire", "value": to_local(old_dt) if old_dt else "?", "inline": True},
+        {"name": "🆕 Nouvel horaire", "value": to_local(new_dt), "inline": True},
+        {"name": "🏆 Tournoi", "value": get_tournament(m), "inline": False},
+    ]
+    send_embed({
+        "title": f"⏰ MATCH DEPLACE — {followed}",
+        "description": f"**{n1}**  vs  **{n2}**\n⚠️ L'horaire du match a change !",
+        "color": COLOR_MOVED,
+        "fields": fields,
+        "footer": {"text": f"Equipe suivie : {followed}  •  agenda mis a jour"},
     })
 
 
@@ -453,10 +538,19 @@ def main():
         cur_start = when.isoformat() if when else None
         # nouveau match OU heure changee (bo3 a corrige) -> on (re)pousse dans l'agenda
         if when and calendared.get(smid) != cur_start:
+            old_iso = calendared.get(smid)   # None = 1re fois ; sinon = ancien horaire
             try:
                 if add_to_calendar(m, f, mid):
                     calendared[smid] = cur_start
                     log(f"Agenda maj {mid} ({f}) -> {to_local(when)}")
+                    # deja programme a une AUTRE heure (>= 5 min d'ecart) -> MATCH DEPLACE
+                    old_dt = _dt(old_iso) if old_iso else None
+                    if old_dt and abs((when - old_dt).total_seconds()) >= 300:
+                        try:
+                            notify_moved(f, m, old_iso, when)
+                            log(f"Deplacement notifie {mid} ({f}) : {to_local(old_dt)} -> {to_local(when)}")
+                        except Exception as e:
+                            log(f"Echec notif deplacement {mid}: {e}")
             except Exception as e:
                 log(f"Echec agenda {mid}: {e}")
         if mid not in announced:
@@ -494,6 +588,9 @@ def main():
         seen_fin.add(mid)
         end = get_end_utc(m)
         if mid not in scored and end and (now - end) <= timedelta(hours=RESULT_LOOKBACK_HOURS):
+            if not _match_complete(m):
+                log(f"Resultat {mid} ({f}) ignore : match pas fini (ex : 1re map d'un Bo3)")
+                continue
             try:
                 notify_result(f, m); scored.add(mid); log(f"Resultat {mid} ({f})")
             except Exception as e:
