@@ -13,6 +13,7 @@ Etat anti-spam dans state.json (commite par le workflow).
 """
 
 import json
+import re
 import os
 import sys
 import urllib.request
@@ -58,7 +59,7 @@ BASE_PARAMS = {
     "page[offset]": "0",
     "page[limit]": "100",
     "filter[matches.discipline_id][eq]": "1",
-    "with": "teams,tournament,games",
+    "with": "teams,tournament,games,stage,round",
 }
 COLOR_NEW = 0x89BFF4
 COLOR_REMINDER = 0xFFB100
@@ -94,25 +95,32 @@ def save_state(s):
 LAST_RAW = {"status": None, "len": 0, "body": "", "url": ""}
 
 
-def _fetch(status, sort):
+def _fetch(status, sort, pages=1):
     from urllib.parse import urlencode
-    p = dict(BASE_PARAMS)
-    p["filter[matches.status][in]"] = status
-    p["sort"] = sort
-    # crochets/virgules litteraux : bo3 attend filter[...] non-encode
-    url = BO3_URL + "?" + urlencode(p, safe="[],.")
-    r = cr.get(url, headers=BO3_HEADERS, impersonate="chrome", timeout=30)
-    body = r.text
-    LAST_RAW.update({"status": r.status_code, "len": len(body), "body": body[:1200], "url": url})
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict):
-        return data.get("data") or data.get("results") or data.get("matches") or data.get("items") or []
-    return data if isinstance(data, list) else []
+    out = []
+    for pg in range(pages):
+        p = dict(BASE_PARAMS)
+        p["filter[matches.status][in]"] = status
+        p["sort"] = sort
+        p["page[offset]"] = str(pg * 100)
+        # crochets/virgules litteraux : bo3 attend filter[...] non-encode
+        url = BO3_URL + "?" + urlencode(p, safe="[],.")
+        r = cr.get(url, headers=BO3_HEADERS, impersonate="chrome", timeout=30)
+        body = r.text
+        LAST_RAW.update({"status": r.status_code, "len": len(body), "body": body[:1200], "url": url})
+        r.raise_for_status()
+        data = r.json()
+        chunk = (data.get("data") or data.get("results") or data.get("matches") or data.get("items") or []) \
+            if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        out += chunk
+        if len(chunk) < 100:
+            break   # derniere page atteinte
+    return out
 
 
 def fetch_upcoming():
-    return _fetch("upcoming,current", "start_date")
+    # plusieurs pages -> couvre ~1 semaine de matchs (sinon 100 = ~1,5 jour, on ratait Vitality plus lointain)
+    return _fetch("upcoming,current", "start_date", pages=6)
 
 
 def fetch_finished():
@@ -402,9 +410,164 @@ def notify_match(title, followed, m, color, footer_extra="", stream_url=None):
         "footer": {"text": f"Equipe suivie : {followed}{footer_extra}"},
     })
 
+# ───────────────────────── phase du tournoi, tour, et "la suite" ─────────────────────────
+_ROUND_FR = [
+    (r"grand\s*final", "grande finale"), (r"semi[\s-]*final", "demi-finale"),
+    (r"quarter[\s-]*final", "quart de finale"), (r"final", "finale"),
+    (r"round\s*(\d+)", r"round \1"), (r"decider", "match décisif"),
+]
+
+
+def get_round(m):
+    r = m.get("round") or {}
+    return r if isinstance(r, dict) else {}
+
+
+def get_stage_title(m):
+    st = m.get("stage") or {}
+    return (st.get("title") or "") if isinstance(st, dict) else ""
+
+
+def round_fr(m):
+    """'Upper bracket quarterfinal' -> 'quart de finale (upper bracket)' ; 'Grand final' -> 'grande finale'."""
+    r = get_round(m)
+    name = (r.get("name") or "").strip()
+    if not name:
+        return ""
+    low = name.lower()
+    core = re.sub(r"(upper|lower)\s*bracket\s*", "", low).strip()
+    out = core
+    for pat, fr in _ROUND_FR:
+        if re.search(pat, core):
+            out = re.sub(pat, fr, core)
+            break
+    bt = (r.get("bracket_type") or "").lower()
+    if "upper" in low or bt == "upper":
+        out += " (upper bracket)"
+    elif "lower" in low or bt == "lower":
+        out += " (lower bracket)"
+    if r.get("is_decider") and "décisif" not in out:
+        out += " — match décisif"
+    return out
+
+
+def _team_id_of(m, followed):
+    for k in ("team1", "team2"):
+        t = m.get(k) or {}
+        if isinstance(t, dict) and t.get("name") and _sig_words(t["name"]) == _sig_words(followed):
+            return t.get("id")
+    return None
+
+
+_TOURN_CACHE = {}
+
+
+def fetch_tournament_matches(tid):
+    """Tous les matchs d'un tournoi (finis + a venir), avec phase et tour. Cache par run."""
+    if tid in _TOURN_CACHE:
+        return _TOURN_CACHE[tid]
+    from urllib.parse import urlencode
+    out = []
+    for status in ("finished", "upcoming,current"):
+        for off in (0, 100, 200):
+            p = {"filter[matches.tournament_id][eq]": str(tid), "filter[matches.status][in]": status,
+                 "page[limit]": "100", "page[offset]": str(off), "with": "teams,tournament,stage,round",
+                 "sort": "start_date"}
+            r = cr.get(BO3_URL + "?" + urlencode(p, safe="[],."), headers=BO3_HEADERS, impersonate="chrome", timeout=30)
+            if r.status_code != 200:
+                break
+            chunk = (r.json() or {}).get("results") or []
+            out += chunk
+            if len(chunk) < 100:
+                break
+    _TOURN_CACHE[tid] = out
+    return out
+
+
+def enrich_round(m):
+    """La liste 'widget' de bo3 ne renvoie pas le tour : on le recupere dans la liste complete du tournoi."""
+    if m.get("round"):
+        return m
+    tid = (m.get("tournament") or {}).get("id") or m.get("tournament_id")
+    mid = get_match_id(m)
+    if not tid or mid is None:
+        return m
+    try:
+        for x in fetch_tournament_matches(tid):
+            if get_match_id(x) == mid:
+                for k in ("round", "stage", "stage_id", "round_id"):
+                    if x.get(k) is not None:
+                        m[k] = x[k]
+                break
+    except Exception as e:
+        log(f"Tour du match non recupere ({e})")
+    return m
+
+
+def _article(rnd):
+    return ("le " if rnd.startswith("round") else "la ") + rnd
+
+
+def _fmt_next(nm_, followed):
+    """'samedi 17:30 vs MOUZ' pour le prochain match (adversaire 'à déterminer' si inconnu)."""
+    t1, t2 = get_team_names(nm_)
+    opp = t2 if _sig_words(t1) == _sig_words(followed) else t1
+    if not opp or re.fullmatch(r"[0-9a-f]{8,}", opp or "") or opp.lower() in ("none", "tbd"):
+        opp = "adversaire à déterminer"
+    w = get_start_utc(nm_)
+    return f"{to_local(w) if w else 'date à confirmer'} vs {opp}"
+
+
+def aftermath(followed, m, won):
+    """Ce qui attend l'equipe suivie apres ce match : qualifiee (prochain match), eliminee, lower bracket, championne.
+    Renvoie (texte, est_elimine, est_champion)."""
+    tid = (m.get("tournament") or {}).get("id") or m.get("tournament_id")
+    mid = get_match_id(m)
+    team_id = _team_id_of(m, followed)
+    rname = (get_round(m).get("name") or "").lower()
+    bt = (get_round(m).get("bracket_type") or "").lower()
+    stage_id = m.get("stage_id") or (m.get("stage") or {}).get("id")
+    stage_title = get_stage_title(m).lower()
+    is_final = bool(re.search(r"final", rname)) and not re.search(r"semi|quarter", rname)
+    if not tid or not team_id:
+        return ("", False, False)
+    try:
+        allm = fetch_tournament_matches(tid)
+    except Exception as e:
+        log(f"Suite tournoi indisponible ({e})")
+        return ("", False, False)
+    # le prochain match de l'equipe dans CE tournoi (pas encore joue)
+    nxt = [x for x in allm if get_match_id(x) != mid and str(x.get("status")) in ("upcoming", "current")
+           and team_id in (x.get("team1_id"), x.get("team2_id"))]
+    nxt.sort(key=lambda x: str(x.get("start_date") or ""))
+    # la phase a-t-elle un lower bracket ? (double elimination -> perdre en upper n'elimine pas)
+    lower_exists = any((x.get("round") or {}).get("bracket_type") == "lower" for x in allm
+                       if (x.get("stage_id") or (x.get("stage") or {}).get("id")) == stage_id)
+    group_like = any(k in stage_title for k in ("group", "swiss", "groupe")) and not lower_exists and not re.search(r"final", rname)
+    if won:
+        if nxt:
+            nr = round_fr(nxt[0])
+            return (f"✅ Qualifié pour {_article(nr) if nr else 'la suite'} — prochain match : {_fmt_next(nxt[0], followed)}", False, False)
+        if is_final and bt != "lower":
+            return ("🏆 **CHAMPION DU TOURNOI !**", False, True)
+        if is_final and bt == "lower":
+            return ("✅ Qualifié pour la grande finale — adversaire et horaire à confirmer", False, False)
+        return ("✅ Qualifié — prochain match pas encore programmé", False, False)
+    # defaite
+    if nxt:
+        where = " (lower bracket)" if (get_round(nxt[0]).get("bracket_type") or "").lower() == "lower" else ""
+        return (f"↘️ Toujours en course{where} — prochain match : {_fmt_next(nxt[0], followed)}", False, False)
+    if bt == "upper" and lower_exists:
+        return ("↘️ Descend en lower bracket — prochain match pas encore programmé", False, False)
+    if group_like and not get_round(m).get("is_decider"):
+        return ("Phase de groupes — prochain match pas encore programmé", False, False)
+    where = f" en {round_fr(m)}" if round_fr(m) else ""
+    return (f"❌ **ÉLIMINÉ du tournoi**{where}", True, False)
+
 
 def notify_result(followed, m):
     # tout est raconte du point de vue de l'equipe suivie (elle est en premier)
+    m = enrich_round(m)
     n1, n2, s1, s2 = _ordered(m, followed)
     winner = get_winner_name(m)
     won = bool(winner) and _sig_words(winner) == _sig_words(followed)
@@ -412,15 +575,30 @@ def notify_result(followed, m):
         desc = f"**{n1}**  {s1} - {s2}  **{n2}**"
     else:
         desc = f"**{n1}**  vs  **{n2}**  (termine)"
-    fields = [{"name": "🏆 Tournoi", "value": get_tournament(m), "inline": True}]
+    rnd = round_fr(m)
+    tourn = get_tournament(m) + (f" • {rnd}" if rnd else "")
+    fields = [{"name": "🏆 Tournoi", "value": tourn, "inline": True}]
+    title = f"🏁 Resultat — {followed}"
     if winner:
         verdict = f"✅ Victoire de {followed} !" if won else f"❌ Defaite de {followed}"
         fields.append({"name": "Resultat", "value": verdict, "inline": True})
         color = COLOR_WIN if won else COLOR_LOSS
+        try:
+            suite, elim, champ = aftermath(followed, m, won)
+        except Exception as e:
+            log(f"Suite du tournoi non calculee : {e}"); suite, elim, champ = "", False, False
+        if suite:
+            fields.append({"name": "Et maintenant ?", "value": suite, "inline": False})
+        if champ:
+            title = f"🏆 CHAMPION — {followed}"
+        elif elim:
+            title = f"❌ ÉLIMINÉ — {followed}" + (f" ({rnd})" if rnd else "")
+        elif rnd:
+            title = f"🏁 Resultat — {followed} ({rnd})"
     else:
         color = COLOR_RESULT
     send_embed({
-        "title": f"🏁 Resultat — {followed}",
+        "title": title,
         "description": desc,
         "color": color,
         "fields": fields,
@@ -430,16 +608,27 @@ def notify_result(followed, m):
 
 def notify_moved(followed, m, old_iso, new_dt):
     """Notif SPECIALE quand l'horaire d'un match a change (ex : 18h -> 13h)."""
+    m = enrich_round(m)
     n1, n2 = _ordered(m, followed)[:2]
     old_dt = _dt(old_iso)
+    # avance ou retarde, et de combien (ex : "avancé de 2 h 30")
+    sens, duree = "déplacé", ""
+    if old_dt:
+        delta = (new_dt - old_dt).total_seconds()
+        mins = int(round(abs(delta) / 60))
+        h, mn = divmod(mins, 60)
+        duree = (f"{h} h" if h else "") + (f" {mn:02d}" if (h and mn) else (f"{mn} min" if (not h) else ""))
+        duree = duree.strip()
+        sens = "avancé" if delta < 0 else "retardé"
+    emoji = "⏩" if sens == "avancé" else ("⏳" if sens == "retardé" else "⏰")
     fields = [
         {"name": "🕐 Ancien horaire", "value": to_local(old_dt) if old_dt else "?", "inline": True},
         {"name": "🆕 Nouvel horaire", "value": to_local(new_dt), "inline": True},
-        {"name": "🏆 Tournoi", "value": get_tournament(m), "inline": False},
+        {"name": "🏆 Tournoi", "value": get_tournament(m) + (f" • {round_fr(m)}" if round_fr(m) else ""), "inline": False},
     ]
     send_embed({
-        "title": f"⏰ MATCH DEPLACE — {followed}",
-        "description": f"**{n1}**  vs  **{n2}**\n⚠️ L'horaire du match a change !",
+        "title": f"{emoji} MATCH {sens.upper()}" + (f" DE {duree.upper()}" if duree else "") + f" — {followed}",
+        "description": f"**{n1}**  vs  **{n2}**\n{emoji} Le match est {sens}" + (f" de **{duree}**" if duree else "") + f" : il commence à **{to_local(new_dt)}**.",
         "color": COLOR_MOVED,
         "fields": fields,
         "footer": {"text": f"Equipe suivie : {followed}  •  agenda mis a jour"},
