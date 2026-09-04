@@ -606,6 +606,15 @@ def notify_result(followed, m):
     })
 
 
+def _heure_locale(dt_utc):
+    """'19H30' en heure de Paris, pour le titre."""
+    try:
+        from zoneinfo import ZoneInfo
+        return dt_utc.astimezone(ZoneInfo(LOCAL_TZ)).strftime("%HH%M")
+    except Exception:
+        return to_local(dt_utc)
+
+
 def notify_moved(followed, m, old_iso, new_dt):
     """Notif SPECIALE quand l'horaire d'un match a change (ex : 18h -> 13h)."""
     m = enrich_round(m)
@@ -627,7 +636,7 @@ def notify_moved(followed, m, old_iso, new_dt):
         {"name": "🏆 Tournoi", "value": get_tournament(m) + (f" • {round_fr(m)}" if round_fr(m) else ""), "inline": False},
     ]
     send_embed({
-        "title": f"{emoji} MATCH {sens.upper()}" + (f" DE {duree.upper()}" if duree else "") + f" — {followed}",
+        "title": f"{emoji} MATCH {sens.upper()} À {_heure_locale(new_dt)} — {followed}",
         "description": f"**{n1}**  vs  **{n2}**\n{emoji} Le match est {sens}" + (f" de **{duree}**" if duree else "") + f" : il commence à **{to_local(new_dt)}**.",
         "color": COLOR_MOVED,
         "fields": fields,
